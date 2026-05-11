@@ -1,126 +1,110 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 
-const CONCURRENCY = 3;        // number of parallel tabs (keep low: 2–5)
+const CONCURRENCY = 3;
 const MIN_DELAY = 2000;
 const MAX_DELAY = 5000;
 const MAX_RETRIES = 3;
 
 function randomDelay() {
   const ms = Math.floor(Math.random() * (MAX_DELAY - MIN_DELAY)) + MIN_DELAY;
-  return new Promise(res => setTimeout(res, ms));
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function extractUsernames(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf-8');
+  const data = JSON.parse(raw);
+
+  const usernames = [];
+
+  for (const item of data) {
+    if (!item.label_values) continue;
+
+    for (const label of item.label_values) {
+      if (label.label === "Username" && label.value) {
+        usernames.push(label.value);
+      }
+    }
+  }
+
+  return [...new Set(usernames)]; // remove duplicates
 }
 
 async function withdrawRequest(context, username, workerId) {
   const page = await context.newPage();
   const url = `https://www.instagram.com/${username}/`;
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      console.log(`🧵 [W${workerId}] ${username} attempt ${attempt}`);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await randomDelay();
 
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
-      await randomDelay();
+    const requestedBtn = page.locator('button:has-text("Requested")');
 
-      const requestedBtn = page.locator('button').filter({ hasText: 'Requested' });
-
-      if (await requestedBtn.count() === 0) {
-        console.log(`❌ [W${workerId}] No request: ${username}`);
-        await page.close();
-        return true;
-      }
-
-      // 👉 Click Requested
-      await requestedBtn.first().click();
-
-      // 👉 WAIT for modal to appear + Unfollow button
-      const unfollowBtn = page.locator('button').filter({ hasText: 'Unfollow' });
-
-      await unfollowBtn.first().waitFor({ timeout: 5000 }); // key fix
-      await randomDelay();
-
-      // 👉 Click Unfollow
-      await unfollowBtn.first().click();
-
-      console.log(`✅ [W${workerId}] Withdrawn: ${username}`);
-
-      await randomDelay();
+    if (await requestedBtn.count() === 0) {
+      console.log(`❌ [W${workerId}] No request: ${username}`);
       await page.close();
-      return true;
-
-    } catch (err) {
-      console.log(`⚠️ [W${workerId}] Retry ${attempt} failed for ${username}`);
-
-      if (attempt === MAX_RETRIES) {
-        console.log(`❌ [W${workerId}] Failed permanently: ${username}`);
-        await page.close();
-        return false;
-      }
-
-      await new Promise(res => setTimeout(res, 4000));
+      return;
     }
+
+    await requestedBtn.first().click();
+    await randomDelay();
+
+    const unfollowBtn = page.locator('button:has-text("Unfollow")');
+
+    await unfollowBtn.first().waitFor({ timeout: 5000 });
+    await unfollowBtn.first().click();
+
+    console.log(`✅ [W${workerId}] Withdrawn: ${username}`);
+
+    await page.close();
+
+  } catch (err) {
+    console.log(`⚠️ [W${workerId}] Failed: ${username}`);
+    await page.close();
   }
 }
 
-// Worker pool
-async function runWorkers(context, usernames) {
-  let index = 0;
-  let success = 0;
-  let failed = 0;
+async function worker(context, usernames, workerId, indexRef) {
+  while (true) {
+    const i = indexRef.value++;
+    if (i >= usernames.length) return;
 
-  async function worker(workerId) {
-    while (index < usernames.length) {
-      const currentIndex = index++;
-      const username = usernames[currentIndex];
+    await withdrawRequest(context, usernames[i], workerId);
+    await randomDelay();
+  }
+}
 
-      const result = await withdrawRequest(context, username, workerId);
+(async () => {
+  const browser = await chromium.launch({
+    headless: true
+  });
 
-      if (result) success++;
-      else failed++;
+  const context = await browser.newContext({
+    storageState: 'auth.json'
+  });
 
-      await randomDelay(); // spacing between tasks
-    }
+  // 👉 JSON INPUT FILE
+  const inputFile = process.argv[2];
+
+  if (!inputFile) {
+    console.log("Usage: node script.js <input_json_file>");
+    process.exit(1);
   }
 
+  const usernames = extractUsernames(inputFile);
+
+  console.log(`📦 Extracted ${usernames.length} usernames`);
+
+  const indexRef = { value: 0 };
+
   const workers = [];
+
   for (let i = 0; i < CONCURRENCY; i++) {
-    workers.push(worker(i + 1));
+    workers.push(worker(context, usernames, i + 1, indexRef));
   }
 
   await Promise.all(workers);
 
-  return { success, failed };
-}
-
-(async () => {
-  const browser = await chromium.launch({ headless: false });
-
-  let context;
-
-  if (fs.existsSync('auth.json')) {
-    context = await browser.newContext({ storageState: 'auth.json' });
-  } else {
-    context = await browser.newContext();
-    const page = await context.newPage();
-
-    await page.goto('https://www.instagram.com/accounts/login/');
-    console.log("👉 Login manually, then press ENTER...");
-    await new Promise(resolve => process.stdin.once('data', resolve));
-
-    await context.storageState({ path: 'auth.json' });
-  }
-
-  const usernames = fs.readFileSync('usernames.txt', 'utf-8')
-    .split('\n')
-    .map(u => u.trim())
-    .filter(Boolean);
-
-  const { success, failed } = await runWorkers(context, usernames);
-
-  console.log(`\n🎯 Done:
-  ✅ Success: ${success}
-  ❌ Failed: ${failed}
-  `);
-
+  console.log("🎯 Done");
   await browser.close();
 })();
